@@ -1,38 +1,36 @@
-# Quiet Skip 1.9.0 release notes
+# 静跳 1.9.0 使用说明
 
-[English](release-notes-1.9.0.md) | [简体中文](release-notes-1.9.0.zh-CN.md)
+v1.9.0 是一次**性能与可靠性**版本：没有新增开关，界面和 1.8.4 基本一致，但 DNS 过滤与无障碍扫描这两条最耗电的路径做了大量减法，同时修掉了几个会长期积累或直接让功能失效的缺陷。
 
-v1.9.0 is a **performance and reliability** release: no new switches, and the UI is essentially the same as 1.8.4, but the two most battery-hungry paths (DNS filtering and accessibility scanning) were trimmed heavily, and several defects that accumulated over time or broke features outright were fixed.
+## 你最可能感觉到的变化
 
-## What you will most likely notice
+1. **DNS 过滤更"扛造"**
+   - **TCP DNS 真正能用**：以前文档写着"支持 TCP 查询"，实际从未完成握手——一旦上游应答被截断、系统改用 TCP 重查，就只能一直等到超时（表现为"网页转圈"）。现在本地会完成 TCP 握手并把查询真正转发出去。
+   - **超长应答不再变成"服务器错误"**：以前应答装不进一个数据包就直接回 SERVFAIL，客户端会认为解析服务器坏了；现在按 DNS 标准回"截断"标记，客户端自动改用 TCP 重查并拿到答案。
+   - **一个坏包不再让整个过滤罢工**：以前隧道里出现一个畸形包，DNS 过滤会直接进入错误状态并停止；现在只丢弃那个包。
+2. **更省电、更少卡顿**
+   - 每条 DNS 查询不再新建套接字、重新授权、重新解析服务器地址，而是复用工作线程上的连接。
+   - 拦截计数改为内存累加、每秒落盘一次（以前每拦截一次写一次磁盘，广告重试风暴下会连续写盘）。
+   - 10.5 万条规则的首屏加载和重新加载明显更快（见验证报告里的实测数据）。
+3. **误点更少**
+   - 修掉"广告证据自我续期"缺陷：以前只要页面上出现过一次"广告"字样，之后就会一直处于"有广告证据"状态，直到你切换应用；现在证据窗口用完即停，普通页面不会被持续当成广告页。
+   - 扫描时同一条文字不再重复计算六次，节点属性也只读取一次，高灵敏度档位下的发热与卡顿会下降。
+4. **应用规则页更快打开**：应用名和图标改到后台读取，不再卡住第一屏。
 
-1. **DNS filtering is much more resilient**
-   - **TCP DNS actually works.** The docs used to claim TCP queries were supported, but the handshake was never completed: once an upstream response was truncated and the system retried over TCP, the query just waited until timeout (which looks like a web page spinning forever). The local side now completes the TCP handshake and really forwards the query.
-   - **Oversized responses no longer turn into "server errors".** Previously a response that did not fit in one packet was answered with SERVFAIL, which clients interpret as a broken resolver; it now returns a standard "truncated" flag so the client retries over TCP and gets its answer.
-   - **One bad packet no longer takes the whole filter down.** A malformed packet in the tunnel used to put DNS filtering into an error state and stop it; now only that packet is dropped.
-2. **Less battery drain, fewer stalls**
-   - Each DNS query no longer creates a socket, re-authorizes the VPN and re-resolves the server address; connections are reused on the worker thread.
-   - The block counter accumulates in memory and flushes to disk once per second (previously every single block wrote to disk, which a flood of ad retries turned into continuous writes).
-   - First-screen loading and reloading of the 105k-rule database is noticeably faster (measurements are in the verification report).
-3. **Fewer mis-taps**
-   - Fixed the "self-renewing ad evidence" defect: once the word "ad" appeared on screen, the app stayed in an "ad evidence present" state until you switched apps; the evidence window now expires as intended, so ordinary pages are not treated as ad pages for long.
-   - The same text is no longer compacted six times per scan, and node attributes are read once, so heat and stalls under the highest sensitivity drop.
-4. **The app-rules page opens faster**: app names and icons load in the background, so the first frame is no longer blocked.
+## 安装
 
-## Install
+1. 覆盖安装 `静跳-v1.9.0.apk`（签名与 1.7.0 起所有版本一致），设置、规则、白名单、计数全部保留。
+2. 若 DNS 过滤原本在运行，升级后需重新点一次"开启 DNS 拦截"。
+3. 无障碍服务如显示"等待授权"，进入系统无障碍设置关闭再开启一次"静跳 · 广告跳转辅助"。
 
-1. Install `quiet-skip-v1.9.0.apk` over the top (the signature matches every release since 1.7.0); settings, rules, whitelist and counters are all preserved.
-2. If DNS filtering was running, tap "Enable DNS blocking" once more after upgrading.
-3. If the accessibility service shows "waiting for authorization", turn "Quiet Skip · ad skipper" off and on again in the system accessibility settings.
+## 验证情况
 
-## Verification
+- **113 项本地自动化测试全部通过**（1.8.4 的 87 项全部保留 + 新增 26 项）。
+- 构建、Lint（0 个问题）、zipalign、v2/v3 签名校验通过；证书与历史版本一致；badging 复核 `1.9.0 (18)`。
+- 仍未做真机验证（本机没有连接设备）。
 
-- **All 113 local automated tests pass** (the 87 from 1.8.4 plus 26 new ones).
-- Build, lint (0 issues), zipalign and v2/v3 signature verification pass; the certificate matches previous releases; badging confirms `1.9.0 (18)`.
-- No physical-device verification was performed (no device connected to this machine).
+## 提醒
 
-## Cautions
-
-- DNS filtering still handles DNS only (not ordinary web, video or download traffic) and occupies Android's single VPN tunnel.
-- The new TCP DNS relay is covered by unit tests for the handshake, segmentation and failure fallback, but it **has not been tried on a real device**. If one app cannot reach the network after upgrading, turn DNS filtering off first to compare: this is the only part that could introduce new problems.
-- Auto-learning, the whitelist and subscription import logic are unchanged.
+- DNS 过滤仍然只接管 DNS（不接管普通网页、视频、下载流量），会占用 Android 唯一的 VPN 通道。
+- 本次新增的 TCP DNS 中继有单元测试覆盖握手、分段和异常回退，但**没有在真机上体验过**。如果升级后出现某个应用无法联网，可以先把 DNS 过滤关掉对照：这是唯一可能引入新问题的部分。
+- 自动学习、白名单、订阅源导入逻辑没有变化。

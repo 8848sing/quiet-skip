@@ -1,201 +1,197 @@
-# Quiet Skip 1.9.0
+# 静跳 1.9.0
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+静跳是一个 Android 本地广告处理工具，结合无障碍选择器、DNS 域名过滤和广告域名自动学习，用来跳过开屏广告、插屏广告和部分弹窗。
 
-Quiet Skip (originally 静跳, "JingJump") is a local ad-handling tool for Android. It combines accessibility selectors, DNS domain filtering and automatic ad-domain learning to dismiss splash ads, interstitial ads and some pop-ups.
+## 1.9.0 优化（热路径与可靠性）
 
-No account, no telemetry, no remote rule subscription: everything runs on the device.
+这一版不加新开关，只把两条最耗电、最容易卡的热路径（DNS 查询、无障碍扫描）做减法，并修掉几个会长期积累的缺陷。
 
-## 1.9.0 update (hot paths and reliability)
+### DNS 过滤
 
-This release adds no new switches. It only trims the two most battery-hungry, stall-prone hot paths (DNS queries and accessibility scanning) and fixes a few defects that used to accumulate over time.
+- **TCP DNS 真正可用**：1.8.0 起文档写着"支持 TCP 端口 53"，但服务从未完成过 TCP 握手，客户端被截断应答（TC=1）逼到 TCP 时只能一直等到超时。新增 `TcpDnsRelay`：本地完成 SYN/SYN-ACK/ACK、按顺序转发长度前缀消息、把应答按 1200 字节分段回注，最多 16 条并发连接、10 秒空闲回收，无法服务时立刻回 RST 让客户端快速失败而不是挂死。
+- **超长应答改为标准截断**：上游应答超过隧道 MTU（IPv4 1452 / IPv6 1452 字节载荷）时，过去直接回 SERVFAIL（客户端会当成服务器坏了）；现在回"保留问题段 + TC=1"的截断应答，客户端自动改用 TCP 重查，配合上面的 TCP 中继真正拿到答案。
+- **缓存 TTL 按时递减**：命中缓存时按已缓存秒数扣减所有记录 TTL，客户端不会再按"原始 TTL"重复使用一个其实快过期的记录。
+- **上游套接字复用**：每个工作线程复用一条已 `protect()` 的 UDP 套接字与解析好的服务器地址，不再每条查询新建 socket、重新 `protect()`、重新解析 IP；接收循环按查询 ID 过滤迟到包（原来是"收到一个不匹配的包就判失败"）。
+- **查询线程池有界**：8 线程 + 96 队列，过载时对溢出的查询立即回 SERVFAIL，不再让积压无限增长。
+- **拦截计数批量落盘**：以前每拦截一次就写一次 SharedPreferences（广告 SDK 重试风暴下就是连续写盘）；现在内存累加、每秒或每 25 次落盘、停止服务时强制落盘，界面读数依然准确。
+- **规则加载提速**：域名规范化增加"已是合法小写 ASCII"快路径（不再每条规则都走 IDN + 正则），ASCII 校验复用同一个预编译正则；10.5 万条规则的首屏加载与重载明显更快。广告域名启发式改为逐标签扫描，不再 `split("\\.")` 生成数组。
+- **单包异常隔离**：隧道读取循环里任何一个畸形包抛异常，过去会直接让整个 DNS 过滤进入错误状态并停止；现在只丢弃该包，其余查询照常处理。
 
-### DNS filtering
+### 无障碍跳过
 
-- **TCP DNS actually works now.** Since 1.8.0 the documentation claimed "TCP port 53 support", but the service never completed a TCP handshake: when a truncated response (TC=1) forced the client onto TCP, it simply waited until timeout. The new `TcpDnsRelay` performs the local SYN/SYN-ACK/ACK, forwards length-prefixed messages in order, reinjects responses in 1200-byte segments, supports up to 16 concurrent connections with a 10-second idle reaper, and answers RST immediately when it cannot serve a connection so the client fails fast instead of hanging.
-- **Oversized responses now use standard truncation.** When an upstream response exceeded the tunnel MTU (1452-byte payload for IPv4 and IPv6), the old code answered SERVFAIL — which clients interpret as a broken server. It now returns a truncated answer containing only the question section with TC=1, so the client retries over TCP and, together with the relay above, actually gets the answer.
-- **Cached TTLs decrement over time.** A cache hit subtracts the elapsed seconds from every record TTL, so clients no longer reuse a nearly expired record as if it had its original TTL.
-- **Upstream socket reuse.** Each worker thread keeps one `protect()`-ed UDP socket and one resolved server address instead of creating a socket, calling `protect()` and re-resolving the IP for every query. The receive loop filters out late packets by query ID (previously a single mismatched packet was treated as a failure).
-- **Bounded query thread pool.** 8 threads with a 96-entry queue; on overload, overflow queries get an immediate SERVFAIL instead of letting the backlog grow without limit.
-- **Batched block counters.** Every blocked query used to write SharedPreferences (a flood of disk writes under an ad-SDK retry storm). Counters now accumulate in memory, flush once per second or every 25 events, and force a flush when the service stops, while the UI reading stays exact.
-- **Faster rule loading.** Domain normalization gained a fast path for "already valid lowercase ASCII" rules (no IDN plus regex per rule) and reuses one precompiled ASCII regex; first-screen loading and reloads of 105k rules are noticeably faster. Ad-domain heuristics now scan label by label instead of building arrays with `split("\\.")`.
-- **Per-packet exception isolation.** A malformed packet in the tunnel read loop used to push the whole DNS filter into an error state and stop it; now only that packet is dropped and the rest keep flowing.
+- **标签只压缩一次**：一次扫描里同一个节点的文字过去会被 `compact()` 六次以上（每次含 4 次字符串替换 + 一次正则），现在每个节点只算一次，随后的匹配都复用；`compact()` 本身也从 4 次 `replace` + `replaceAll` 改为一遍字符扫描，并顺带清掉中文按钮常见的全角空格（U+3000 与 NBSP）。
+- **节点属性记忆化**：内置 13 条通用 GKD 选择器会依次遍历整棵节点树，过去每条选择器都对每个节点重新问一遍类名、文字、描述、边界和可见性（都是跨进程调用）；现在同一个节点在一次扫描内只取一次。
+- **不可见节点不再占内存**：只有"可见且尺寸为正"的节点才会进入候选列表，"页面是否简单"的判据改用遍历计数，语义不变但对象数量大幅下降。
+- **规则与档位对象复用**：`RuleStore.get()` 增加按偏好原文的解析缓存（规则页滚动时不再每行重新解析整份 JSON），四个灵敏度档位改为共享实例，不再每次扫描新建。
+- **修复"广告证据"窗口自我续期**：过去一旦出现过一次广告字样，`evidenceUntil` 会在每次扫描时被"缓存证据"重新续上 5 秒，等于应用在前台期间一直处于"有广告证据"状态，误点风险随时间上升。现在只有**本次扫描真正观察到**的证据才延长窗口，缓存证据用完即止。
+- **应用规则页后台加载**：应用名与图标改在后台线程读取，首帧不再被 200 多个应用的图标加载卡住。
 
-### Accessibility skipping
+### 验证
 
-- **Labels are compacted once per scan.** The text of a node used to be run through `compact()` six or more times per scan (each call doing four string replacements plus a regex). It is now computed once per node and reused by every later match. `compact()` itself moved from four `replace` calls plus `replaceAll` to a single character scan, which also strips the ideographic spaces (U+3000 and NBSP) common in Chinese buttons.
-- **Memoized node attributes.** The 13 built-in generic GKD selectors walk the whole node tree; previously each selector re-asked every node for class name, text, description, bounds and visibility (all cross-process calls). Now each node is queried once per scan.
-- **Invisible nodes no longer take memory.** Only nodes that are visible with a positive size enter the candidate list, and the "simple page" test uses traversal counts instead of holding objects; semantics are unchanged but object counts drop sharply.
-- **Reused rule and profile objects.** `RuleStore.get()` gained a parse cache keyed by the raw preference text (no more re-parsing the whole JSON for every row while scrolling the rules page), and the four sensitivity profiles are now shared instances instead of being rebuilt per scan.
-- **Fixed the self-renewing "ad evidence" window.** Once any ad-like text appeared, the cached evidence re-extended `evidenceUntil` by 5 seconds on every scan, so the app stayed in an "ad evidence present" state for as long as it was in the foreground and the mis-tap risk grew over time. Only evidence actually observed in the current scan extends the window now; cached evidence is consumed and expires.
-- **App-rules page loads in the background.** App names and icons are read on a background thread, so the first frame is no longer blocked by loading icons for 200+ apps.
+- **113 项本地自动化测试全部通过**（1.8.4 的 87 项 + 新增 26 项：TCP 中继 6 项、截断与 TTL 4 项、快速路径等价性 8 项、规则缓存 4 项、计数批量 2 项等）。
+- 版本号：`1.9.0 (18)`。
 
-### Verification
+## 1.8.4 修复与测试补齐
 
-- **All 113 local automated tests pass** (the 87 from 1.8.4 plus 26 new ones: 6 TCP relay, 4 truncation and TTL, 8 fast-path equivalence, 4 rule cache, 2 batched counters and so on).
-- Version: `1.9.0 (18)`.
+- **修复"自动学习"开关不即时生效**：关闭方向因 `inspectAndLearn` 内部复查偏好而侥幸正确，但**开启**方向会一直等到下一次规则重载或重启过滤才生效。现在切换开关即调用重载入口（`refreshSettings()` 先于指纹判断执行，不会重新解析规则库）。
+- **自动学习链路补齐 6 项测试**（此前零覆盖）：高置信域名首次学习、中置信两次晋升、关闭后不学习、域名规范化（大小写/首尾空格/尾点）、清空后候选计数一并清空、普通域名不误学。
+- 版本号：`1.8.4 (17)`。
 
-## 1.8.4 fixes and test coverage
+## 1.8.3 优化（重载稳定性）
 
-- **Fixed the auto-learn switch not taking effect immediately.** The off direction happened to work because `inspectAndLearn` re-checked the preference internally, but turning it on waited for the next rule reload or filter restart. Toggling the switch now calls the reload entry point directly (`refreshSettings()` runs before the fingerprint check, so the rule database is not re-parsed).
-- **Six tests for the auto-learn path** (previously zero coverage): first-time learning of a high-confidence domain, promotion after two medium-confidence hits, no learning while disabled, domain normalization (case, surrounding whitespace, trailing dot), candidate counts cleared together with the list, and ordinary domains never being learned.
-- Version: `1.8.4 (17)`.
+- **重载合并**：连续快速切换"扩展规则库 / 严格模式"时，规则重载改为单线程串行 + 至多一次补跑，不再并发解析 10.5 万条规则（低端机内存峰值风险）。
+- **免重载**：新增规则输入指纹（扩展库开关、严格模式、手动黑/白名单、导入文件时间戳与大小）。只改"拦截方式"这类廉价开关时不再重新解析整个规则库，但开关本身仍立即生效。
+- **启动竞态**：启动过程中改设置不再被静默忽略——启动完成后比对指纹，发现不一致自动补一次重载。
+- **hosts 注释解析**：支持制表符分隔的同行注释（`0.0.0.0 a.com<TAB># 注释`）；紧贴域名的 `#` 不再被静默截断，而是按畸形行计数。
+- 版本号：`1.8.3 (16)`。
 
-## 1.8.3 update (reload stability)
+## 1.8.2 优化（缓存与实时性）
 
-- **Merged reloads.** Rapidly toggling "extended rule database / strict mode" now serializes reloads on a single thread with at most one follow-up run, instead of parsing 105k rules concurrently (a memory-peak risk on low-end phones).
-- **Reload avoidance.** A rule-input fingerprint (extended database switch, strict mode, manual black/white lists, imported file timestamps and sizes) means cheap switches such as "blocking method" no longer re-parse the whole database, while the switch itself still applies immediately.
-- **Startup race.** Changing settings during startup is no longer silently ignored: the fingerprint is compared once startup finishes and a reload is scheduled if it differs.
-- **hosts comment parsing.** Supports tab-separated trailing comments (`0.0.0.0 a.com<TAB># comment`); a `#` glued to a domain is no longer silently truncated but counted as a malformed line.
-- Version: `1.8.3 (16)`.
+- **否定缓存**：NODATA / NXDOMAIN 按 RFC 2308 从 authority 段 SOA 提取 TTL（上限 300s）缓存；广告 SDK 反复查询不存在的域名时不再回源，省电且更快。
+- **修复 TC 截断标志位掩码错误**（`0x0002` → `0x0200`）：此前真实截断应答会被当作完整应答缓存、并参与 CNAME 判定；而 rcode=3 的 NXDOMAIN 反被误判为截断。已补回归测试。
+- **上游粘性**：记住上一次成功的解析服务器并优先使用，首选服务器故障时冷查询不再每次都白等 900ms 超时。
+- **拦截记录实时刷新**：规则页打开期间每 1.2s 检查一次版本号，仅在有新拦截时重建列表。
+- **界面减负**：主界面状态轮询 800ms → 1000ms，且文本未变化时不触发重绘。
+- 版本号：`1.8.2 (15)`。
 
-## 1.8.2 update (caching and freshness)
+## 1.8.1 优化（性能与内存）
 
-- **Negative caching.** NODATA / NXDOMAIN TTLs are taken from the authority-section SOA per RFC 2308 (capped at 300 s) and cached, so ad SDKs polling non-existent domains stop hitting upstream — less battery, less latency.
-- **Fixed the TC truncation flag mask** (`0x0002` → `0x0200`): real truncated responses were cached as complete and fed into CNAME checks, while NXDOMAIN answers with rcode=3 were misread as truncated. A regression test now covers it.
-- **Upstream stickiness.** The last successful resolver is remembered and preferred, so cold queries no longer wait out the 900 ms timeout on every attempt when the primary is down.
-- **Live block-log refresh.** While the rules page is open it checks a version counter every 1.2 s and rebuilds the list only when new blocks arrived.
-- **Lighter UI polling.** The main status poll went from 800 ms to 1000 ms and skips repaints when the text is unchanged.
-- Version: `1.8.2 (15)`.
+- **规则裁剪**：扩展规则库在打包时与加载时都会去掉"父域已覆盖"的子域条目（11.2 万 → 10.5 万，内置表 145 → 131），拦截判定完全不变，内存与加载时间下降。
+- **快照零拷贝**：规则快照不再对每个源集合做防御性拷贝，加载峰值内存约减半。
+- **上游改串行短超时**：去掉每次查询新建 2 条裸线程的竞速模型，改为 900ms×2 串行 + 缓存兜底，DNS 风暴下不再产生线程抖动。
+- **拦截记录去重**：同一域名+类型的重复拦截合并为一条并计数（列表显示 ×N），200 条容量不再被单个重试风暴刷满。
+- **UI 线程减负**：系统"私人 DNS"检测从 800ms 轮询移到 onResume；订阅源导入解析移出主线程（后台线程 + 完成回调），8MB 大文件不会 ANR。
+- **修复规则裁剪祖先链推进 bug**（该 bug 为本次新功能引入，已连带回归测试锁死行为等价性）。
+- **导入 hosts 文件不再误拦本机名称**：`localhost`、`localdomain`、`broadcasthost` 属 hosts 格式性条目，按 RFC 6761 约定豁免。
+- **修复白名单被 CNAME 伪装检测打断**：白名单域名的应答链不再被改写为拦截应答；黑名单编辑器里的 `@@` 例外按 AdGuard 语义并入白名单。
+- **修复导入信息损坏时的页面崩溃**，并对上游应答校验 ID/QR 位。
+- 版本号：`1.8.1 (14)`。
 
-## 1.8.1 update (performance and memory)
+## 1.8.0 更新（DNS 拦截增强）
 
-- **Rule pruning.** The extended database drops subdomains already covered by a parent entry both at packaging and at load time (112k → 105k entries, built-in table 145 → 131) with identical blocking decisions, lowering memory and load time.
-- **Zero-copy snapshots.** Rule snapshots no longer make defensive copies of every source set; peak load memory is roughly halved.
-- **Serial upstream with short timeouts.** The previous model that spawned two bare threads per query is gone; queries now run 900 ms × 2 serially with cache fallback, so DNS storms no longer cause thread churn.
-- **Deduplicated block log.** Repeated blocks of the same domain and query type merge into one row with a counter (shown as ×N), so a single retry storm can no longer fill the 200-entry list.
-- **Less work on the UI thread.** The system "Private DNS" check moved from an 800 ms poll to `onResume`; subscription import parsing moved off the main thread (background thread plus completion callback), so an 8 MB file no longer risks an ANR.
-- **Fixed an ancestor-chain advance bug in rule pruning** (introduced by the new pruning feature; a regression test now pins behavior equivalence).
-- **Imported hosts files no longer block local names.** `localhost`, `localdomain` and `broadcasthost` are format artefacts of hosts files and are exempt per RFC 6761.
-- **Fixed whitelist entries broken by CNAME cloaking detection.** Whitelisted domains no longer get their response chain rewritten into a block response, and `@@` exceptions in the blacklist editor are merged into the whitelist following AdGuard semantics.
-- **Fixed a crash on corrupted import data**, and upstream responses are now validated for the ID and QR bits.
-- Version: `1.8.1 (14)`.
+- **规则库扩容**：新增 anti-AD 扩展规则库（约 11.2 万条域名，MIT 许可，已随 APK 打包），覆盖广告、统计、诈骗与博彩站点；可在首页单独开关，默认开启。
+- **AdGuard 语法支持**：手动名单与订阅源支持 `||域名^`、`@@||域名^` 例外规则、`/etc/hosts` 行和纯域名四种格式（参照 AdGuard DNS 规则语法规范的可用子集；正则与 `$client`、`$dnstype` 等无法在本地实现的修饰符按规范忽略）。
+- **白名单**：新增最高优先级白名单，命中后任何规则（包括扩展库、导入订阅源和自动学习）都不再拦截该域名及其子域。
+- **订阅源导入**：可从本机文本文件导入第三方规则列表（支持 AdGuard/hosts/纯域名），上限 8MB / 40 万条，带有效与忽略条数统计；不引入任何远程下载。
+- **假地址拦截**：默认改用 sinkhole 应答——A 查询回 `0.0.0.0`、AAAA 回 `::1`、其他类型返回空 NOERROR（Pi-hole / AdGuard Home 的做法），比 NXDOMAIN 更快让广告 SDK 失败；可切回旧版 NXDOMAIN 行为。
+- **IPv6 全支持**：TUN 增加 ULA v6 地址，可解析并应答 IPv6 DNS 查询（含 RFC 1071 UDP 校验和）。
+- **拦截面扩大**：接管常见公共解析器路由（阿里 223.5.5.5/223.6.6.6、腾讯 DNSPod、Google 8.8.8.8/8.8.4.4、Cloudflare 1.1.1.1/1.0.0.1、114、百度等 v4+v6 共 23 条 /32 与 /128 路由），硬编码 DNS 的应用也会经过滤。仍然只路由 DNS 服务器地址，不接管普通流量。
+- **TCP DNS 支持**：端口 53 的 TCP 查询可直接解析并应答（大响应/截断重试不再绕过过滤）。
+- **严格模式（可选，默认关）**：拦截已知 DoH/DoT 服务商域名（dns.google、cloudflare-dns.com、dns.alidns.com、doh.pub、dns.adguard.com 等 21 个），并对已接管解析器的 853 端口握手回绝（TCP RST），迫使加密 DNS 客户端退回可过滤的普通 DNS；系统"私人 DNS"开启时首页显示提醒。
+- **CNAME 伪装检测**：对上游应答扫描答案域名与 CNAME 目标，命中规则库时替换为拦截应答（对付用正常域名 CNAME 指向广告域名的 cloaked tracking）。
+- **上游并发 + 本地缓存**：阿里/腾讯双服务器并发竞速（1.4s 总超时），应答按 TTL 本地缓存 256 条，重复查询不再耗流量。
+- **拦截记录**：内存保留最近 200 条拦截（时间、域名、查询类型、命中来源），不落盘；点击记录可一键把域名加入白名单。
+- **规则热重载**：修改白/黑名单、开关扩展库或严格模式后无需重启 DNS 过滤。
+- 自动学习域名上限从 300 提到 600，学习集合改为内存缓存，查询路径不再每次重解析。
+- 版本号：`1.8.0 (13)`。
 
-## 1.8.0 update (stronger DNS blocking)
+## 灵敏度档位
 
-- **Larger rule database.** Added the anti-AD extended list (about 112k domains, MIT licensed, bundled in the APK) covering advertising, tracking, scam and gambling sites; it has its own toggle on the home screen and is on by default.
-- **AdGuard syntax.** Manual lists and subscriptions accept `||domain^`, `@@||domain^` exceptions, `/etc/hosts` lines and bare domains (the usable subset of the AdGuard DNS rule syntax; regex and modifiers such as `$client` or `$dnstype` that cannot work locally are ignored per the spec).
-- **Whitelist.** A new highest-priority whitelist: once a domain matches, no rule (extended list, imported subscriptions or auto-learning) blocks it or its subdomains.
-- **Subscription import.** Third-party lists can be imported from a local text file (AdGuard / hosts / bare domains, up to 8 MB or 400k entries) with accepted/ignored counts; nothing is downloaded remotely.
-- **Sinkhole blocking.** The default blocking mode answers A queries with `0.0.0.0`, AAAA with `::1` and other types with an empty NOERROR (the Pi-hole / AdGuard Home approach), failing ad SDKs faster than NXDOMAIN; the old NXDOMAIN behavior is still selectable.
-- **Full IPv6.** The TUN interface gained a ULA v6 address and can resolve and answer IPv6 DNS queries (including RFC 1071 UDP checksums).
-- **Broader coverage.** Routes for common public resolvers are taken over (AliDNS 223.5.5.5/223.6.6.6, Tencent DNSPod, Google 8.8.8.8/8.8.4.4, Cloudflare 1.1.1.1/1.0.0.1, 114, Baidu and others — 23 routes as /32 and /128), so apps with hard-coded DNS still get filtered. Only DNS server addresses are routed; ordinary traffic is not.
-- **TCP DNS.** TCP queries on port 53 are resolved and answered directly, so large or truncated-retry responses no longer bypass filtering.
-- **Strict mode (optional, off by default).** Blocks known DoH/DoT provider domains (dns.google, cloudflare-dns.com, dns.alidns.com, doh.pub, dns.adguard.com and 21 in total) and answers TCP RST to port 853 handshakes on hijacked resolvers, forcing encrypted-DNS clients back to filterable plain DNS; the home screen warns when the system Private DNS is enabled.
-- **CNAME cloaking detection.** Upstream responses are scanned for answer names and CNAME targets that match the rules and replaced with a block response, catching cloaked tracking that points normal domains at ad domains.
-- **Concurrent upstream plus local cache.** Ali and Tencent resolvers race concurrently (1.4 s total timeout) and responses are cached locally by TTL (256 entries), so repeated queries cost no traffic.
-- **Block log.** The most recent 200 blocks (time, domain, query type, matched source) are kept in memory only, and tapping one white-lists that domain.
-- **Hot rule reload.** Editing the black/white lists or toggling the extended list or strict mode needs no DNS filter restart.
-- The auto-learn cap went from 300 to 600 domains and the learning set lives in an in-memory cache, so the query path no longer re-parses it.
-- Version: `1.8.0 (13)`.
-
-## Sensitivity profiles
-
-| Profile | First scan | Follow-up scan | Active window | Continuous sweep | Resident scan | Delayed follow-up | Structural matching |
+| 档位 | 首次扫描 | 补扫 | 活跃窗口 | 连续巡检 | 常驻扫描 | 延迟补扫 | 结构识别 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Conservative | 150 ms | 620 ms | 8 s | 8 s / 760 ms | 1000 ms | none | no |
-| Standard | 90 ms | 420 ms | 12 s | 12 s / 500 ms | 650 ms | 3× / 1.5 s | no |
-| Sensitive | 55 ms | 240 ms | 20 s | 20 s / 380 ms | 450 ms | 8× / 1.2 s | yes |
-| Instant | 30 ms | 140 ms | 35 s | 30 s / 260 ms | 320 ms | 14× / 0.9 s | yes + text-free corners |
+| 保守 | 150ms | 620ms | 8s | 8s / 760ms | 1000ms | 无 | 否 |
+| 标准 | 90ms | 420ms | 12s | 12s / 500ms | 650ms | 3 次 / 1.5s | 否 |
+| 灵敏 | 55ms | 240ms | 20s | 20s / 380ms | 450ms | 8 次 / 1.2s | 是 |
+| 极速 | 30ms | 140ms | 35s | 30s / 260ms | 320ms | 14 次 / 0.9s | 是 + 无文字角落 |
 
-Guidance:
+建议：
 
-- Most apps work fine on "Standard".
-- Apps that delay their ads, or whose pop-ups are icon-only, do better on "Sensitive".
-- Apps with especially many splash ads, where occasional mis-taps are acceptable, can use "Instant".
-- Keep anti-mis-tap protection on for apps with comments, input fields or payment flows.
+- 大多数应用用“标准”。
+- 经常延迟弹广告、或弹窗里只有图标没有文字的应用，用“灵敏”。
+- 开屏广告特别多、且能接受少量误触的应用，用“极速”。
+- 有评论、输入框、支付等敏感操作的应用，保持“防误触保护”开启。
 
-## Install
+## 安装
 
-Grab the APK from the [Releases](../../releases) page.
+在 [Releases](../../releases) 页面下载 APK。
 
-1. Install `quiet-skip-v1.9.0.apk`.
-2. Open Quiet Skip, read the notice and tap "Enable accessibility service", then enable "Quiet Skip · ad skipper" under the system's installed services.
-3. For network-level blocking, tap "Enable DNS blocking" and grant the VPN permission.
-4. Adding the app to the battery-optimization allowlist is recommended to reduce the chance of the system killing its services.
+1. 安装 `quiet-skip-v1.9.0.apk`（与 1.7.0 起各版本签名一致，可直接覆盖安装）。
+2. 打开静跳，阅读说明后点“开启无障碍服务”，在系统“已安装的服务”中开启“静跳 · 广告跳转辅助”。
+3. 如需网络层拦截，点“开启 DNS 拦截”并允许系统 VPN 授权。
+4. 建议加入电池优化白名单，降低系统后台清理服务的概率。
 
-On some Android 13+ phones that block accessibility services for side-loaded apps, open "Settings → Apps → Quiet Skip → overflow menu" and choose "Allow restricted settings".
+Android 13 及以上的部分手机如果禁止开启侧载应用的无障碍服务，请进入“设置 → 应用 → 静跳 → 右上角菜单”，选择“允许受限设置”。
 
-## The two filtering layers
+## 两个过滤层
 
-### Accessibility skipping
+### 无障碍跳过
 
-- Recognizes short buttons such as "Skip", "Skip ad", "跳过" and common ad control IDs.
-- Ships GKD-style selector rules that match nodes by class name, `text/vid/id/desc`, comparison operators and parent, ancestor or sibling relations.
-- "App rules" lets you append several custom selector lines per app, for example `TextView[text*="跳过"][visibleToUser=true]`.
-- Every app can pick its own sensitivity; the home screen sets the default.
-- Each app also has its own "continuous scan" switch; when on, that app is scanned repeatedly at the resident interval of its sensitivity while it is in the foreground.
-- Before tapping a "close"-like button it checks ad text, control ID, visibility and size; anti-mis-tap mode only allows an unambiguous skip button at the top or the bottom-right corner.
-- Consecutive pop-ups: after one successful close it keeps sweeping per profile, handling 10 to 45 pop-ups in a row depending on the profile.
-- When strong ad evidence appears (a tap that jumps to a third-party app, "shake", "download now"), small text-free close icons in the top-left, top-right and bottom-right corners are recognized.
-- "Try text-free buttons" is off by default; the Sensitive and Instant profiles attempt corner close icons automatically when structural evidence holds.
+- 识别“跳过、跳过广告、Skip”等短按钮和常见广告控件 ID。
+- 内置 GKD 风格选择器规则，可通过类名、`text/vid/id/desc`、比较运算以及父子、祖先、兄弟关系定位节点。
+- “应用规则”中可以为单个应用追加多行自定义选择器，例如 `TextView[text*="跳过"][visibleToUser=true]`。
+- 每个应用都可以单独选择灵敏度；主界面设置默认灵敏度。
+- 每个应用仍有独立的“持续扫描”开关。开启后，该应用在前台时按当前灵敏度的常驻间隔循环扫描。
+- 点击“关闭”类按钮前，会检查广告文字、控件 ID、可见性和尺寸；防误触模式只允许顶部或右下角的明确跳过按钮。
+- 连续弹窗：成功关闭一次后，会按当前档位继续巡检，最多处理 10～45 个连续弹窗（随档位变化）。
+- 检测到“点击跳转第三方应用”“摇一摇”“立即下载”等强广告证据时，可识别左上、右上和右下的小型无文字关闭图标。
+- “尝试识别无文字按钮”默认关闭；灵敏/极速档会在结构证据成立时自动尝试角落关闭图标。
 
-### DNS ad blocking
+### DNS 广告过滤
 
-- The VPN notification, in-app status, starting, running and failed states all share one persisted state.
-- Ships a conservative ad-domain list plus the anti-AD extended database (about 112k entries, MIT licensed, see `assets/LICENSE-anti-ad.txt`), toggleable on the home screen and on by default.
-- Supports AdGuard syntax (`||domain^`, `@@||domain^` exceptions), `/etc/hosts` lines and bare domain lists; regex and other `$` modifiers are ignored per the AdGuard DNS spec.
-- The whitelist has the highest priority: once a domain matches, no rule (extended list, imported subscriptions, auto-learning) blocks it or its subdomains.
-- The "Rules and block log" page edits manual black/white lists, imports subscriptions from local text files (8 MB / 400k entries), shows the last 200 blocks and white-lists a domain with one tap.
-- The default blocking mode is a fake address: A answers `0.0.0.0`, AAAA answers `::1`, other types get an empty NOERROR; the old NXDOMAIN behavior remains selectable.
-- Auto-learning of ad domains: high-risk markers such as `adservice`, `adserver`, `adx`, `mobads` and ad SDK names are learned and blocked on first sight; weaker markers such as `tracking`, `metrics` and `beacon` need a second sighting; the cap is 600 entries.
-- Resolves IPv4 and IPv6 UDP and TCP port 53 queries; takes over `/32` and `/128` routes for common public resolvers (Ali, Tencent, Google, Cloudflare, 114, Baidu, Quad9 and others) without touching ordinary web, video or download traffic.
-- Strict mode (off by default): blocks known DoH/DoT provider domains and refuses port 853 handshakes on hijacked resolvers to mitigate encrypted-DNS bypass; the home screen warns when the system Private DNS is on.
-- CNAME cloaking detection: a response whose answer names or CNAME targets match the rules is replaced with a block response.
-- Two upstream servers (`223.5.5.5`, `119.29.29.29`) race concurrently, responses are cached locally by TTL (256 entries), and rule edits hot-reload without restarting the filter.
-- Enabling it occupies the single Android VPN slot, so it cannot run alongside other VPNs or network accelerators.
-- Ad assets already downloaded locally may still display once; DNS only stops later configuration and asset requests.
-- Apps with private HTTPDNS (direct IP), fixed IPs or domains shared with their real business traffic still slip through; strict mode only partly mitigates DoH/DoT.
+- VPN 通知、软件内状态、启动中、运行中和失败状态使用同一份持久化状态。
+- 内置保守广告域名规则 + anti-AD 扩展规则库（约 11.2 万条，MIT 许可，见 `assets/LICENSE-anti-ad.txt`），可在首页开关，默认开启。
+- 支持 AdGuard 语法（`||域名^`、`@@||域名^` 例外）、`/etc/hosts` 行和纯域名列表；正则与其他 `$` 修饰符按 AdGuard DNS 规范忽略。
+- 白名单优先级最高：命中白名单后任何规则（含扩展库、导入订阅源、自动学习）都不再拦截该域名及子域。
+- “管理规则与拦截记录”页可编辑手动黑/白名单、从本机文本文件导入订阅源（8MB / 40 万条上限）、查看最近 200 条拦截记录并一键加白。
+- 拦截方式默认“假地址”：A 回 `0.0.0.0`、AAAA 回 `::1`、其他类型空 NOERROR；可切回 NXDOMAIN 旧行为。
+- 自动学习广告域名：`adservice`、`adserver`、`adx`、`mobads`、广告 SDK 等高风险特征首次出现就加入并拦截；`tracking`、`metrics`、`beacon` 等可疑特征出现两次后才加入；上限 600 条。
+- 解析 IPv4 与 IPv6 的 UDP/TCP 端口 53 查询；接管常见公共解析器（阿里、腾讯、Google、Cloudflare、114、百度、Quad9 等）的 `/32`、`/128` 路由，不接管普通网页、视频或下载流量。
+- 严格模式（默认关）：拦截已知 DoH/DoT 服务商域名并对已接管解析器的 853 端口回绝握手，缓解加密 DNS 绕过；系统“私人 DNS”开启时首页提示。
+- CNAME 伪装检测：应答中出现命中规则库的域名或 CNAME 目标时替换为拦截应答。
+- 上游双服务器（`223.5.5.5`、`119.29.29.29`）并发竞速，应答按 TTL 本地缓存 256 条；规则修改后支持热重载，无需重启过滤。
+- 开启后会占用 Android 唯一的 VPN 通道，不能和其他 VPN、网络加速器同时运行。
+- 已经下载到本地的广告素材仍可能显示一次；DNS 只阻止后续配置和素材请求。
+- 应用私有 HTTPDNS（IP 直连）、固定 IP 与业务共用域名仍无法过滤；严格模式只能部分缓解 DoH/DoT。
 
-## Shake-to-jump ads
+## 摇一摇广告
 
-Shake-triggered ads are driven by the motion sensor. Quiet Skip closes the page as soon as it appears; to stop the trigger itself, search for "Motion and orientation" or "Body sensors" in the system settings and revoke that permission from the offending app.
+摇一摇广告由运动传感器触发。静跳会尽快关闭已经出现的页面；要阻止触发，请在系统设置中搜索“运动与方向”或“身体传感器”，关闭对应 App 的权限。
 
-## Staying alive in the background
+## 后台存活
 
-- The main activity is set to `excludeFromRecents`, so it does not show in the recent-tasks list; swiping the task away does not stop the accessibility service or the DNS foreground service.
-- The "Background survival (Redmi)" section opens the battery-optimization allowlist, MIUI autostart management and battery saver settings directly.
-- On Redmi phones, allow Quiet Skip to autostart and set the battery saver policy to "No restrictions".
-- With DNS filtering on, the VPN foreground service raises process survival; on Android 13+ allowing notifications is recommended.
+- 主界面设置为 `excludeFromRecents`，不会出现在最近任务列表中；上滑清理任务后不会主动停止无障碍服务和 DNS 前台服务。
+- “后台存活（红米）”区域可以直接打开电池优化白名单、MIUI 自启动管理和省电策略设置。
+- 红米手机建议允许静跳自启动，并把省电策略设置为“无限制”。
+- 开启 DNS 过滤时，VPN 前台服务会提高进程存活率；Android 13 及以上建议允许静跳通知。
 
-## Privacy and permissions
+## 隐私和权限
 
-- `INTERNET` is used only to forward DNS queries to the two public resolvers above; there are no web requests, no remote rule subscriptions, no accounts and no self-hosted service, and subscriptions come only from local files.
-- There is no server, no account, no analytics SDK and no telemetry.
-- Input-field nodes are not read, button text is not recorded, and app lists or screen contents are never uploaded.
-- The installed-app list is used only to pick per-app rules locally.
-- DNS rules, switches and counters live in the local `SharedPreferences`; imported subscriptions live in the local `files` directory.
-- Auto-learning stores only candidate ad domains and a few pending counts; the block log is memory-only (last 200) and vanishes when the process ends.
+- `INTERNET` 只用于把 DNS 查询转发到上述两个公共解析器；没有网页请求、远程规则订阅、账号或自建服务模块，订阅源仅从本机文件导入。
+- 没有自建服务器、账号、统计 SDK 或遥测上报。
+- 不读取输入框节点，不记录按钮文字，不上传应用列表或界面内容。
+- 应用列表只用于本地选择规则。
+- DNS 规则、开关和计数保存在本机 `SharedPreferences`；导入的订阅源保存在本机 `files` 目录。
+- 自动学习仅保存候选广告域名及少量待确认次数；拦截记录只保留在内存（最近 200 条），不写磁盘，进程结束即消失。
 
-## Implementation notes
+## 技术实现
 
-- `minSdk 26`, `targetSdk 35`, `compileSdk 35`.
-- `AccessibilityService` judges buttons by text, control ID, ad markers, window type, window hierarchy, node structure, size and position.
-- `SensitivityProfile` resolves each app to its own scan policy; `RuleStore` persists the `sensitivity` field (`-1` means follow the global default).
-- Before tapping it checks visibility, size, area and clickable ancestors, and it throttles tap rate and actions per window.
-- No repeat taps at the same coordinates within 1.6 s; the Sensitive and Instant profiles move on to the next candidate.
-- `VpnService` parses IPv4/IPv6 UDP DNS queries and opens real relayed TCP 53 connections (handshake, ordering, segmented reinjection); rule hits produce a local block answer (NXDOMAIN or fake address) while other queries go through the serial upstream with TTL caching (remembering the last successful resolver); in strict mode, port 853 TCP handshakes are refused.
-- The VPN configuration explicitly excludes Quiet Skip itself so upstream queries never re-enter the local TUN.
-- The GKD selector support is an independently implemented subset of the common syntax, not a copy of GPL-3.0 GKD service code. It supports common attribute comparisons, the `@` target marker, `>`, `>n`, `<`, `<n`, `<<n`, `+n` and `-n`; computed expressions and complex range syntax are not supported.
-- The DNS rule syntax and blocking answers follow the AdGuard DNS rule specification and Pi-hole's defaults; the extended database comes from anti-AD (MIT). No project code was copied.
+- `minSdk 26`，`targetSdk 35`，`compileSdk 35`。
+- `AccessibilityService` 根据文字、控件 ID、广告标记、窗口类型、窗口层级、控件结构、尺寸和位置判断按钮。
+- `SensitivityProfile` 把每个应用解析为独立的扫描策略；`RuleStore` 持久化 `sensitivity` 字段（`-1` 表示跟随全局）。
+- 点击前检查可见性、尺寸、面积和可点击祖先，并限制点击频率与单窗口动作次数。
+- 同坐标 1.6 秒内不重复点击；灵敏/极速档会尝试下一个候选目标。
+- `VpnService` 解析 IPv4/IPv6 的 UDP DNS 查询，并对 TCP 53 建立真实的中继连接（握手、排序、分段回注）；命中规则时生成本地拦截应答（NXDOMAIN 或假地址），其他查询经带 TTL 缓存的串行上游转发（记住上次成功的解析器）；严格模式下对 853 端口 TCP 握手回绝。
+- VPN 配置明确排除静跳自身，避免上游 DNS 查询重新进入本地 TUN。
+- GKD 选择器能力为独立实现的常用语法子集，没有复制 GPL-3.0 的 GKD 服务代码。当前支持常用属性比较、`@` 目标标记、`>`、`>n`、`<`、`<n`、`<<n`、`+n`、`-n`；不支持计算表达式和复杂范围语法。
+- DNS 规则语法与拦截应答方式参考了 AdGuard DNS 规则规范与 Pi-hole 的默认做法；扩展规则库来自 anti-AD（MIT）。均未复制任何项目代码。
 
-## Boundaries
+## 边界
 
-- Ads drawn by game engines, video frames or pure Canvas without accessibility nodes cannot be detected.
-- Pages completely hidden from the accessibility tree cannot be handled.
-- When ads share a container with normal UI, automatic tapping cannot be 100% accurate; higher profiles mean a higher chance of mis-taps.
-- Some apps use private HTTPDNS (direct IP), fixed IPs or persistent connections for ads, which DNS filtering cannot cover; DoH/DoT is only partly mitigated by strict mode.
-- Player picture-in-picture, system-level pop-ups and a system-frozen accessibility service can let ads through.
-- This release was not tested on a physical device; it passed Robolectric API 28/35 activity startup tests and all 113 local tests, but real-device behavior still needs your verification.
+- 游戏引擎、视频画面或纯 Canvas 绘制且没有无障碍节点的广告无法识别。
+- 对无障碍树完全隐藏的页面无法处理。
+- 广告与正常界面共用容器时，自动点击不可能做到百分之百准确；档位越高，误触概率越高。
+- 某些 App 会使用私有 HTTPDNS（IP 直连）、固定 IP 或长连接广告接口，DNS 过滤无法覆盖；DoH/DoT 只能靠严格模式部分缓解。
+- 播放器画中画、系统级弹窗和无障碍服务被系统冻结时，可能漏过广告。
+- 本版本未连接真机；已通过 Robolectric API 28/35 的页面启动测试与全部 113 项本地测试，真机效果仍需你安装验证。
 
-## Build
+## 构建
 
-Requires JDK 17, Android SDK 35 and Gradle 8.10.2:
+需要 JDK 17、Android SDK 35 和 Gradle 8.10.2：
 
 ```powershell
 .\gradlew.bat :app:lintDebug :app:assembleRelease
 ```
 
-Signing can keep using `apk-sign.bat` at the project root (which reads `tools/mykey.keystore`).
+签名可继续使用项目根目录的 `apk-sign.bat`（读取 `tools/mykey.keystore`）。
 
-This project is an independent implementation. It draws on the publicly visible ideas of "ad evidence + control detection + safe tapping" and "local DNS filtering" from an APK supplied by the user, without reusing its service code or assets.
+本项目为独立实现，参考了用户提供 APK 中公开可见的“广告证据 + 控件识别 + 安全点击”和“DNS 本地过滤”思路，没有复用其服务代码或资源。
