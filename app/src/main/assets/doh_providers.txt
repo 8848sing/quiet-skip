@@ -1,0 +1,24 @@
+# Known DNS-over-HTTPS / DNS-over-TLS endpoint hostnames.
+# Blocked only when "strict mode" is on, so apps that try to bypass the
+# local filter with encrypted DNS fall back to regular resolvable DNS.
+dns.google
+chrome-dns.com
+cloudflare-dns.com
+security.cloudflare-dns.com
+mozilla.cloudflare-dns.com
+one.one.one.one
+dns.quad9.net
+quad9.net
+dns.alidns.com
+resolved.dns.alidns.com
+doh.pub
+dns.adguard.com
+adguard-dns.io
+dnsforge.de
+dns.sb
+doh.dns.sb
+dot.sb
+brave-dns.com
+dns.tuna.tsinghua.edu.cn
+crypto-name.eu
+doh.360.cn

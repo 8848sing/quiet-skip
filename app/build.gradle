@@ -1,0 +1,94 @@
+plugins {
+    id "com.android.application"
+}
+
+android {
+    namespace "com.jingjump.app"
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.jingjump.app"
+        minSdk 26
+        targetSdk 35
+        versionCode 18
+        versionName "1.9.0"
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    testOptions {
+        unitTests {
+            includeAndroidResources = true
+        }
+    }
+
+    lint {
+        abortOnError false
+    }
+}
+
+dependencies {
+    testImplementation "junit:junit:4.13.2"
+    testImplementation "org.robolectric:robolectric:4.14.1"
+    testImplementation "androidx.test:monitor:1.7.2"
+}
+
+tasks.register("printUnitTestClasspath") {
+    doLast {
+        println configurations.releaseUnitTestRuntimeClasspath.asPath
+    }
+}
+
+// Gradle's Test Worker cannot start under this Windows profile's non-ASCII
+// path (same as 1.6.x/1.7.x verification), so tests run through plain
+// JUnitCore launched from the daemon: gradle assembleRelease javaTest
+tasks.register("javaTest", JavaExec) {
+    dependsOn "compileReleaseUnitTestJavaWithJavac",
+            "generateReleaseUnitTestConfig",
+            "packageReleaseUnitTestForUnitTest",
+            "mergeReleaseAssets"
+    classpath = files(
+            new File(android.sdkDirectory, "platforms/android-35/android.jar"),
+            layout.buildDirectory.dir(
+                    "intermediates/unit_test_config_directory/releaseUnitTest/generateReleaseUnitTestConfig/out"
+            ),
+            layout.buildDirectory.dir(
+                    "intermediates/javac/releaseUnitTest/compileReleaseUnitTestJavaWithJavac/classes"
+            ),
+            configurations.releaseUnitTestRuntimeClasspath
+    )
+    mainClass = "org.junit.runner.JUnitCore"
+    workingDir = projectDir
+    systemProperty "java.awt.headless", "true"
+    systemProperty "file.encoding", "UTF-8"
+    systemProperty "robolectric.offline", "false"
+    doFirst {
+        // AARs on the raw runtime classpath are unreadable to a plain JVM:
+        // resolve every artifact through AGP's classes-jar transform as well.
+        def jarView = configurations.releaseUnitTestRuntimeClasspath
+                .incoming.artifactView {
+                    attributes { it.attribute(
+                            Attribute.of("artifactType", String), "android-classes-jar") }
+                }
+        classpath = classpath + files(jarView.files)
+        def names = project.hasProperty("classes")
+                ? project.property("classes").toString().split(",").toList()
+                : ["com.jingjump.app.DnsRuleParserTest"]
+        // simple name or FQN both accepted
+        args names.collect { it.startsWith("com.") ? it : "com.jingjump.app." + it }
+    }
+}

@@ -1,0 +1,15 @@
+# Independent GKD-style selector subset. Format: package|selector
+# "*" applies to every app. Keep generic close rules constrained by ad evidence.
+*|*[text="跳过"][visibleToUser=true]
+*|*[text="跳过广告"][visibleToUser=true]
+*|*[text*="跳过"][text.length<10][visibleToUser=true]
+*|*[desc*="跳过"][desc.length<10][visibleToUser=true]
+*|*[text*="skip"][text.length<12][visibleToUser=true]
+*|*[vid*="ad_skip"][visibleToUser=true]
+*|*[vid*="skip_ad"][visibleToUser=true]
+*|*[vid*="skip_button"][visibleToUser=true]
+*|*[text="关闭广告"][visibleToUser=true]
+*|*[text*="关闭广告"][text.length<12][visibleToUser=true]
+*|*[text*="广告"][visibleToUser=true] >n *[vid*="close"][visibleToUser=true]
+*|*[text*="广告"][visibleToUser=true] +n *[vid*="close"][visibleToUser=true]
+*|*[text*="摇一摇"][visibleToUser=true] >n *[text*="关闭"][text.length<8][visibleToUser=true]
