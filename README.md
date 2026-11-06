@@ -107,6 +107,8 @@ Guidance:
 
 ## Install
 
+Grab the APK from the [Releases](../../releases) page.
+
 1. Install `quiet-skip-v1.9.0.apk`.
 2. Open Quiet Skip, read the notice and tap "Enable accessibility service", then enable "Quiet Skip · ad skipper" under the system's installed services.
 3. For network-level blocking, tap "Enable DNS blocking" and grant the VPN permission.
